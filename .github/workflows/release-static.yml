@@ -3,17 +3,32 @@ name: Release Static FFmpeg (amd64)
 on:
   workflow_dispatch:
     inputs:
-      ffmpeg_branches:
-        description: 'FFmpeg branches to build (space separated)'
-        type: string
-        default: '7.1 8.1 9.0'
+      ffmpeg_branch:
+        description: 'FFmpeg branch to build'
+        type: choice
+        options:
+          - '7.1'
+          - '8.1'
+          - '9.0'
+        default: '8.1'
         required: false
       doRelease:
         description: 'Publish new release'
         type: boolean
         default: true
         required: false
-
+  workflow_call:
+    inputs:
+      ffmpeg_branch:
+        description: 'FFmpeg branch to build'
+        type: string
+        default: '8.1'
+        required: false
+      doRelease:
+        description: 'Publish new release'
+        type: boolean
+        default: true
+        required: false
 permissions:
   contents: write
   packages: write
@@ -90,12 +105,6 @@ jobs:
           ./download.sh
           ./util/clean_cache.sh
           tar czf .cache/cache.tar.gz .cache/downloads/*
-      - name: Upload cache artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: download-cache
-          overwrite: true
-          path: .cache/cache.tar.gz
 
   merge_base:
     name: Merge base image
@@ -240,7 +249,7 @@ jobs:
       fail-fast: false
       matrix:
         target: [linux64]
-        variant: [gpl 7.1, gpl 8.1, gpl 9.0]
+        branch: ['${{ inputs.ffmpeg_branch }}']
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -259,7 +268,7 @@ jobs:
       - name: Image Name
         id: imagename
         run: |
-          IMG="${GITHUB_REPOSITORY,,}/${{ matrix.target }}-${{ matrix.variant }}"
+          IMG="${GITHUB_REPOSITORY,,}/${{ matrix.target }}-gpl-${{ matrix.branch }}"
           IMG="${IMG// /-}"
           echo "name=ghcr.io/${IMG}" >> $GITHUB_OUTPUT
       - name: Get download cache key
@@ -269,7 +278,7 @@ jobs:
       - name: Stop Commands
         run: T="$(echo -n ${{ github.token }} | sha256sum | head -c 64)" && echo -e "::add-mask::${T}\n::stop-commands::${T}"
       - name: Generate Dockerfile
-        run: ./generate.sh ${{ matrix.target }} ${{ matrix.variant }}
+        run: ./generate.sh ${{ matrix.target }} gpl ${{ matrix.branch }}
       - name: Cache
         uses: actions/cache/restore@v6
         with:
@@ -341,7 +350,7 @@ jobs:
       fail-fast: false
       matrix:
         target: [linux64]
-        variant: [gpl 7.1, gpl 8.1, gpl 9.0]
+        branch: ['${{ inputs.ffmpeg_branch }}']
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -356,17 +365,18 @@ jobs:
       - name: Build ffmpeg
         run: |
           T="$(echo -n ${{ github.token }} | sha256sum | head -c 64)" && echo -e "::add-mask::${T}\n::stop-commands::${T}"
-          ./build.sh ${{ matrix.target }} ${{ matrix.variant }}
+          ./build.sh ${{ matrix.target }} gpl ${{ matrix.branch }}
       - name: Replace spaces in string
         id: strs
         run: |
-          SLUG="${{ matrix.target }}-${{ matrix.variant }}"
+          SLUG="${{ matrix.target }}-gpl-${{ matrix.branch }}"
           echo "artifact_slug=${SLUG// /-}" >> $GITHUB_OUTPUT
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: ffmpeg-${{ steps.strs.outputs.artifact_slug }}
           overwrite: true
+          retention-days: 1
           path: artifacts/*
 
   publish_release:
