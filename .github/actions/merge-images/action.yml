@@ -26,12 +26,13 @@ runs:
         TAG: ${{ inputs.tag }}
       run: |
         set -eo pipefail
-        shopt -s nullglob
         declare -A SRCS
-        for F in "$RUNNER_TEMP"/imgmerge/*/image; do
-          REF="$(<"$F")"
-          SRCS["${REF%:*}"]+=" ${REF}"
-        done
+        if [[ -d "$RUNNER_TEMP/imgmerge" ]]; then
+          while IFS= read -r -d '' F; do
+            REF="$(<"$F")"
+            SRCS["${REF%:*}"]+=" ${REF}"
+          done < <(find "$RUNNER_TEMP/imgmerge" -type f -name image -print0)
+        fi
         for IMG in "${!SRCS[@]}"; do
           echo "Merging${SRCS[$IMG]} into ${IMG}:${TAG}"
           docker buildx imagetools create -t "${IMG}:${TAG}" ${SRCS[$IMG]}
