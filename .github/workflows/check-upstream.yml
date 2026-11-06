@@ -1,0 +1,81 @@
+name: Check upstream FFmpeg releases
+
+# Periodically checks FFmpeg upstream release branches for new commits.
+# When a branch moves (or has never been seen), it kicks off
+# release-static.yml for that branch with doRelease=true and records the
+# new commit SHA in a repository variable (LAST_SEEN_71/81/90).
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+  variables: write
+
+jobs:
+  check:
+    name: Check upstream branches
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Compare upstream branches to last-seen variables
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          PRIMARY_URL="https://github.com/FFmpeg/FFmpeg.git"
+          FALLBACK_URL="https://github.com/BtbN/ffmpeg.git"
+          BRANCHES=("7.1" "8.1" "9.0")
+          # variable name suffix per branch (7.1 -> 71, ...)
+          VARS=("LAST_SEEN_71" "LAST_SEEN_81" "LAST_SEEN_90")
+
+          # Try the primary upstream; fall back to the mirror if unreachable.
+          URL="$PRIMARY_URL"
+          REMOTE_OUTPUT="$(timeout 60 git ls-remote "$URL" \
+            'release/7.1' 'release/8.1' 'release/9.0' 2>/dev/null || true)"
+          if [ -z "$REMOTE_OUTPUT" ]; then
+            echo "Primary upstream unreachable/empty; trying fallback mirror."
+            URL="$FALLBACK_URL"
+            REMOTE_OUTPUT="$(timeout 60 git ls-remote "$URL" \
+              'release/7.1' 'release/8.1' 'release/9.0' 2>/dev/null || true)"
+          fi
+          if [ -z "$REMOTE_OUTPUT" ]; then
+            echo "::error::Both upstream sources unreachable."
+            exit 1
+          fi
+          echo "Using upstream source: $URL"
+
+          changed=()
+          for i in "${!BRANCHES[@]}"; do
+            branch="${BRANCHES[$i]}"
+            var="${VARS[$i]}"
+            sha="$(printf '%s\n' "$REMOTE_OUTPUT" \
+              | awk -v b="release/${branch}" '$2 == "refs/heads/" b { print $1; exit }')"
+            if [ -z "$sha" ]; then
+              echo "Branch release/${branch} not found upstream; skipping."
+              continue
+            fi
+            old="$(gh variable get "$var" --repo "$REPO" 2>/dev/null || true)"
+            if [ -z "$old" ] || [ "$old" != "$sha" ]; then
+              echo "Changed: release/${branch} (${old:-<unset>} -> $sha)"
+              changed+=("$branch")
+              gh workflow run release-static.yml \
+                --repo "$REPO" --ref master \
+                -f "ffmpeg_branch=${branch}" -f doRelease=true
+              gh variable set "$var" --body "$sha" --repo "$REPO"
+            else
+              echo "Unchanged: release/${branch} ($sha)"
+            fi
+          done
+
+          if [ "${#changed[@]}" -gt 0 ]; then
+            echo "Triggered releases for: ${changed[*]}"
+            printf 'changed_branches=%s\n' "${changed[*]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "No upstream changes detected."
+          fi
