@@ -33,6 +33,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       ARCH: ${{ matrix.arch }}
+      DOCKER_TAG_SUFFIX: -x86
     steps:
       - name: Checkout
         uses: actions/checkout@v7
