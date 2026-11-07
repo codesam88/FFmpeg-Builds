@@ -12,6 +12,16 @@ on:
           - '9.0'
         default: '8.1'
         required: false
+      ffmpeg_tag:
+        description: 'Exact upstream tag to build (e.g. n8.1.3). Empty = branch HEAD.'
+        type: string
+        default: ''
+        required: false
+      force:
+        description: 'Force rebuild even if not new (debug)'
+        type: boolean
+        default: false
+        required: false
       doRelease:
         description: 'Publish new release'
         type: boolean
@@ -23,6 +33,16 @@ on:
         description: 'FFmpeg branch to build'
         type: string
         default: '8.1'
+        required: false
+      ffmpeg_tag:
+        description: 'Exact upstream tag to build (e.g. n8.1.3). Empty = branch HEAD.'
+        type: string
+        default: ''
+        required: false
+      force:
+        description: 'Force rebuild even if not new (debug)'
+        type: boolean
+        default: false
         required: false
       doRelease:
         description: 'Publish new release'
@@ -251,6 +271,12 @@ jobs:
         target: [linux64]
         branch: ['${{ inputs.ffmpeg_branch }}']
     steps:
+      - name: Validate ffmpeg_branch
+        run: |
+          case "${{ inputs.ffmpeg_branch }}" in
+            7.1|8.1|9.0) ;;
+            *) echo "Invalid ffmpeg_branch: ${{ inputs.ffmpeg_branch }}" >&2; exit 1 ;;
+          esac
       - name: Checkout
         uses: actions/checkout@v7
       - name: Free Disk-Space
@@ -346,6 +372,8 @@ jobs:
     name: Build ffmpeg
     needs: [build_targets, merge_targets]
     runs-on: ubuntu-latest
+    outputs:
+      detected: ${{ steps.normalize.outputs.detected }}
     strategy:
       fail-fast: false
       matrix:
@@ -363,6 +391,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Build ffmpeg
+        env:
+          GIT_BRANCH_OVERRIDE: ${{ inputs.ffmpeg_tag }}
         run: |
           T="$(echo -n ${{ github.token }} | sha256sum | head -c 64)" && echo -e "::add-mask::${T}\n::stop-commands::${T}"
           ./build.sh ${{ matrix.target }} gpl ${{ matrix.branch }}
@@ -371,17 +401,44 @@ jobs:
         run: |
           SLUG="${{ matrix.target }}-gpl-${{ matrix.branch }}"
           echo "artifact_slug=${SLUG// /-}" >> $GITHUB_OUTPUT
+      - name: Detect and normalize artifact
+        id: normalize
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(artifacts/*.tar.xz)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No tar.xz artifact found" >&2
+            exit 1
+          fi
+          f="${files[0]}"
+          base="$(basename "$f")"
+          if [[ "$base" =~ ffmpeg-(n[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            ver="${BASH_REMATCH[1]}"
+          else
+            echo "Could not detect nX.Y.Z from $base" >&2
+            exit 1
+          fi
+          num="${ver#n}"
+          new="artifacts/ffmpeg-${ver}-static.amd64.tar.xz"
+          if [[ "$f" != "$new" ]]; then
+            mv "$f" "$new"
+          fi
+          echo "detected=$num" >> $GITHUB_OUTPUT
+          echo "asset=$new" >> $GITHUB_OUTPUT
+          echo "version=$ver" >> $GITHUB_OUTPUT
+          echo "Mapping: input_tag=${{ inputs.ffmpeg_tag }} built=$ver detected_num=$num asset=$(basename "$new") tagname=${{ inputs.ffmpeg_tag || format('n{0}', num) }}"
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: ffmpeg-${{ steps.strs.outputs.artifact_slug }}
           overwrite: true
-          retention-days: 1
+          retention-days: 3
           path: artifacts/*
 
   publish_release:
     name: Publish release
-    if: ${{ !cancelled() && (inputs.doRelease == true || github.event.inputs.doRelease == 'true') && needs.build_ffmpeg.result == 'success' }}
+    if: ${{ !cancelled() && (inputs.doRelease == true || github.event.inputs.doRelease == 'true' || inputs.force == true) && needs.build_ffmpeg.result == 'success' }}
     needs: build_ffmpeg
     runs-on: ubuntu-latest
     steps:
@@ -397,22 +454,40 @@ jobs:
           pattern: ffmpeg-*
           merge-multiple: true
           path: artifacts
+      - name: Detect downloaded asset
+        id: asset
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(artifacts/ffmpeg-n*-static.amd64.tar.xz)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No normalized asset found" >&2
+            exit 1
+          fi
+          f="${files[0]}"
+          base="$(basename "$f")"
+          echo "path=$f" >> $GITHUB_OUTPUT
+          echo "base=$base" >> $GITHUB_OUTPUT
+          echo "Mapping: asset=$base tagname=${{ inputs.ffmpeg_tag || format('n{0}', needs.build_ffmpeg.outputs.detected) }}"
+      - name: Create checksum
+        run: |
+          set -euo pipefail
+          cd artifacts
+          base="${{ steps.asset.outputs.base }}"
+          sha256sum "$base" > "$base.sha256"
       - name: Create release
         id: create_release
-        run: |
-          set -xe
-          shopt -s nullglob
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            TAGNAME="${GITHUB_REF_NAME}"
-          else
-            TAGNAME="release-$(date +'%Y-%m-%d')"
-          fi
-          RELDATE="$(date +'%Y-%m-%d %H:%M')"
-          NAME="Auto-Build $RELDATE"
-          (cd artifacts && sha256sum *.{zip,tar.xz} > checksums.sha256)
-          ./util/release_body.sh "$TAGNAME" artifacts/*.{zip,tar.xz} > release_body.md
-          gh release create "$TAGNAME" --target "master" --title "$NAME" --notes-file release_body.md artifacts/*.{zip,tar.xz} artifacts/checksums.*
-          echo "tag_name=${TAGNAME}" >> $GITHUB_OUTPUT
-          echo "rel_date=${RELDATE}" >> $GITHUB_OUTPUT
         env:
           GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -xe
+          TAGNAME="${{ inputs.ffmpeg_tag || format('n{0}', needs.build_ffmpeg.outputs.detected) }}"
+          ASSET="artifacts/${{ steps.asset.outputs.base }}"
+          ASSET_SHA="${ASSET}.sha256"
+          RELDATE="$(date +'%Y-%m-%d %H:%M')"
+          if ! gh release view "$TAGNAME" >/dev/null 2>&1; then
+            gh release create "$TAGNAME" --title "$TAGNAME" --notes "Automated build for $TAGNAME"
+          fi
+          gh release upload --clobber "$TAGNAME" "$ASSET" "$ASSET_SHA"
+          echo "tag_name=${TAGNAME}" >> $GITHUB_OUTPUT
+          echo "rel_date=${RELDATE}" >> $GITHUB_OUTPUT

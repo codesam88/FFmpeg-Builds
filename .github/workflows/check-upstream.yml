@@ -1,14 +1,19 @@
 name: Check upstream FFmpeg releases
 
-# Periodically checks FFmpeg upstream release branches for new commits.
-# When a branch moves (or has never been seen), it kicks off
-# release-static.yml for that branch with doRelease=true and records the
-# new commit SHA in a repository variable (LAST_SEEN_71/81/90).
+# Daily check of FFmpeg upstream release tags (n<version>).
+# When a new n-tag is found (or a rebuild is forced), it triggers
+# release-static.yml for that branch with doRelease=true.
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 6 * * *'
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force rebuild of current releases (debug)'
+        type: boolean
+        default: false
+        required: false
 
 permissions:
   contents: read
@@ -17,32 +22,38 @@ permissions:
 
 jobs:
   check:
-    name: Check upstream branches
+    name: Check upstream branch ${{ matrix.branch }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        branch: ['7.1', '8.1', '9.0']
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      FORCE: ${{ inputs.force || false }}
     steps:
-      - name: Compare upstream branches to last-seen variables
+      - name: Compare upstream tags to last-seen variables
         env:
           REPO: ${{ github.repository }}
+          BRANCH: ${{ matrix.branch }}
         run: |
           set -euo pipefail
 
           PRIMARY_URL="https://github.com/FFmpeg/FFmpeg.git"
           FALLBACK_URL="https://github.com/BtbN/ffmpeg.git"
-          BRANCHES=("7.1" "8.1" "9.0")
-          # variable name suffix per branch (7.1 -> 71, ...)
-          VARS=("LAST_SEEN_71" "LAST_SEEN_81" "LAST_SEEN_90")
 
-          # Try the primary upstream; fall back to the mirror if unreachable.
+          # variable name suffix per branch (7.1 -> 71, ...)
+          SUFFIX="${BRANCH//./}"
+          VAR="LAST_SEEN_${SUFFIX}"
+
+          # Try primary upstream; fall back to mirror if unreachable.
           URL="$PRIMARY_URL"
-          REMOTE_OUTPUT="$(timeout 60 git ls-remote "$URL" \
-            'release/7.1' 'release/8.1' 'release/9.0' 2>/dev/null || true)"
+          REMOTE_OUTPUT="$(timeout 60 git ls-remote "$URL" "refs/tags/n${BRANCH}.*" 2>/dev/null || true)"
           if [ -z "$REMOTE_OUTPUT" ]; then
             echo "Primary upstream unreachable/empty; trying fallback mirror."
             URL="$FALLBACK_URL"
-            REMOTE_OUTPUT="$(timeout 60 git ls-remote "$URL" \
-              'release/7.1' 'release/8.1' 'release/9.0' 2>/dev/null || true)"
+            REMOTE_OUTPUT="$(timeout 60 git ls-remote "$URL" "refs/tags/n${BRANCH}.*" 2>/dev/null || true)"
           fi
           if [ -z "$REMOTE_OUTPUT" ]; then
             echo "::error::Both upstream sources unreachable."
@@ -50,32 +61,63 @@ jobs:
           fi
           echo "Using upstream source: $URL"
 
-          changed=()
-          for i in "${!BRANCHES[@]}"; do
-            branch="${BRANCHES[$i]}"
-            var="${VARS[$i]}"
-            sha="$(printf '%s\n' "$REMOTE_OUTPUT" \
-              | awk -v b="release/${branch}" '$2 == "refs/heads/" b { print $1; exit }')"
-            if [ -z "$sha" ]; then
-              echo "Branch release/${branch} not found upstream; skipping."
-              continue
-            fi
-            old="$(gh variable get "$var" --repo "$REPO" 2>/dev/null || true)"
-            if [ -z "$old" ] || [ "$old" != "$sha" ]; then
-              echo "Changed: release/${branch} (${old:-<unset>} -> $sha)"
-              changed+=("$branch")
-              gh workflow run release-static.yml \
-                --repo "$REPO" --ref master \
-                -f "ffmpeg_branch=${branch}" -f doRelease=true
-              gh variable set "$var" --body "$sha" --repo "$REPO"
-            else
-              echo "Unchanged: release/${branch} ($sha)"
-            fi
-          done
-
-          if [ "${#changed[@]}" -gt 0 ]; then
-            echo "Triggered releases for: ${changed[*]}"
-            printf 'changed_branches=%s\n' "${changed[*]}" >> "$GITHUB_OUTPUT"
-          else
-            echo "No upstream changes detected."
+          # Pick latest semver n-tag for this branch (e.g. n8.1.3).
+          latest_tag="$(printf '%s\n' "$REMOTE_OUTPUT" \
+            | sed 's/.*refs\/tags\///' \
+            | sed 's/\^{}//' \
+            | grep -E "^n${BRANCH//./\\.}\\." \
+            | sort -Vu \
+            | tail -n 1)"
+          if [ -z "$latest_tag" ]; then
+            echo "No n-tags found for branch ${BRANCH}; skipping."
+            exit 0
           fi
+          echo "Latest upstream tag: $latest_tag"
+
+          old="$(gh variable get "$VAR" --repo "$REPO" 2>/dev/null || true)"
+
+          build=false
+          if [ "${FORCE}" = "true" ]; then
+            echo "Force rebuild requested."
+            build=true
+          elif [ -z "$old" ] || [ "$old" != "$latest_tag" ]; then
+            echo "New tag detected (${old:-<unset>} -> $latest_tag)."
+            build=true
+          else
+            echo "No new tag (last seen: $old)."
+          fi
+
+          # Also rebuild if the per-version release is missing on the fork.
+          if [ "$build" != "true" ]; then
+            if ! gh release view "$latest_tag" --repo "$REPO" >/dev/null 2>&1; then
+              echo "Release $latest_tag missing on fork; rebuilding."
+              build=true
+            fi
+          fi
+
+          if [ "$build" != "true" ]; then
+            echo "Skipping build for ${BRANCH}."
+            exit 0
+          fi
+
+          echo "Triggering release-static.yml for ${BRANCH} (${latest_tag})..."
+          gh workflow run release-static.yml \
+            --repo "$REPO" --ref master \
+            -f "ffmpeg_branch=${BRANCH}" \
+            -f "ffmpeg_tag=${latest_tag}" \
+            -f "force=${FORCE}" \
+            -f "doRelease=true"
+
+          # Wait for the triggered run to finish to keep builds serial.
+          run_id=""
+          for _ in $(seq 1 30); do
+            run_id="$(gh run list --repo "$REPO" --workflow release-static.yml --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
+            [ -n "$run_id" ] && break
+            sleep 5
+          done
+          if [ -n "$run_id" ]; then
+            echo "Watching run $run_id"
+            gh run watch "$run_id" --repo "$REPO" --exit-status || echo "Build run did not succeed."
+          fi
+
+          gh variable set "$VAR" --body "$latest_tag" --repo "$REPO"
