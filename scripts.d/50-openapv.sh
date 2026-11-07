@@ -30,12 +30,16 @@ ffbuild_dockerbuild() {
     make -j$(nproc)
     make install DESTDIR="$FFBUILD_DESTDIR"
 
-    rm -rf "$FFBUILD_DESTPREFIX"/{bin,lib/oapv,lib/import,include/oapv/oapv_exports.h,lib/liboapv.so*}
+    if [[ -f "$FFBUILD_DESTPREFIX"/lib/oapv/liboapv.a ]]; then
+        mv "$FFBUILD_DESTPREFIX"/lib/oapv/liboapv.a "$FFBUILD_DESTPREFIX"/lib/liboapv.a
+    fi
 
-    {
-        echo "Libs.private: -lm"
-        echo "Cflags.private: -DOAPV_STATIC_DEFINE"
-    } >> "$FFBUILD_DESTPREFIX"/lib/pkgconfig/oapv.pc
+    sed -i \
+        -e 's#\(includedir=.*\)/oapv#\1#' \
+        -e 's#^Libs\.private:.*#Libs.private: -lm#' \
+        "$FFBUILD_DESTPREFIX"/lib/pkgconfig/oapv.pc
+
+    rm -rf "$FFBUILD_DESTPREFIX"/{bin,lib/oapv,lib/import,include/oapv/oapv_exports.h,lib/liboapv.so*}
 }
 
 ffbuild_configure() {
