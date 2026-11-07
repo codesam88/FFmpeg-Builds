@@ -65,10 +65,14 @@ jobs:
         include:
           - runner: ubuntu-latest
             arch: x86
+            docker_tag_suffix: -x86
+          - runner: ubuntu-26.04-arm
+            arch: arm64
+            docker_tag_suffix: -arm64
     runs-on: ${{ matrix.runner }}
     env:
       ARCH: ${{ matrix.arch }}
-      DOCKER_TAG_SUFFIX: -x86
+      DOCKER_TAG_SUFFIX: ${{ matrix.docker_tag_suffix }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -175,7 +179,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [linux64]
+        target: [linux64, linuxarm64]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -268,7 +272,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [linux64]
+        target: [linux64, linuxarm64]
         branch: ['${{ inputs.ffmpeg_branch }}']
     steps:
       - name: Validate ffmpeg_branch
@@ -377,7 +381,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [linux64]
+        target: [linux64, linuxarm64]
         branch: ['${{ inputs.ffmpeg_branch }}']
     steps:
       - name: Checkout
@@ -419,14 +423,20 @@ jobs:
             echo "Could not detect nX.Y.Z from $base" >&2
             exit 1
           fi
+          case "${{ matrix.target }}" in
+            linux64) arch=amd64 ;;
+            linuxarm64) arch=arm64 ;;
+            *) echo "Unknown target ${{ matrix.target }}" >&2; exit 1 ;;
+          esac
           num="${ver#n}"
-          new="artifacts/ffmpeg-${ver}-static.amd64.tar.xz"
+          new="artifacts/ffmpeg-${ver}-static.${arch}.tar.xz"
           if [[ "$f" != "$new" ]]; then
             mv "$f" "$new"
           fi
           echo "detected=$num" >> $GITHUB_OUTPUT
           echo "asset=$new" >> $GITHUB_OUTPUT
           echo "version=$ver" >> $GITHUB_OUTPUT
+          echo "arch=$arch" >> $GITHUB_OUTPUT
           echo "Mapping: input_tag=${{ inputs.ffmpeg_tag }} built=$ver detected_num=$num asset=$(basename "$new") tagname=n${num}"
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -454,27 +464,36 @@ jobs:
           pattern: ffmpeg-*
           merge-multiple: true
           path: artifacts
-      - name: Detect downloaded asset
+      - name: Detect version
         id: asset
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(artifacts/ffmpeg-n*-static.amd64.tar.xz)
+          files=(artifacts/ffmpeg-n*-static.*.tar.xz)
           if [[ ${#files[@]} -eq 0 ]]; then
             echo "No normalized asset found" >&2
             exit 1
           fi
           f="${files[0]}"
           base="$(basename "$f")"
-          echo "path=$f" >> $GITHUB_OUTPUT
-          echo "base=$base" >> $GITHUB_OUTPUT
-          echo "Mapping: asset=$base tagname=${{ inputs.ffmpeg_tag || format('n{0}', needs.build_ffmpeg.outputs.detected) }}"
-      - name: Create checksum
+          if [[ "$base" =~ ffmpeg-(n[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            ver="${BASH_REMATCH[1]}"
+          else
+            echo "Could not detect version from $base" >&2
+            exit 1
+          fi
+          num="${ver#n}"
+          echo "version=$ver" >> $GITHUB_OUTPUT
+          echo "num=$num" >> $GITHUB_OUTPUT
+          echo "Mapping: assets=${files[*]} tagname=${{ inputs.ffmpeg_tag || format('n{0}', needs.build_ffmpeg.outputs.detected) }}"
+      - name: Create checksums
         run: |
           set -euo pipefail
           cd artifacts
-          base="${{ steps.asset.outputs.base }}"
-          sha256sum "$base" > "$base.sha256"
+          shopt -s nullglob
+          for f in ffmpeg-n*-static.*.tar.xz; do
+            sha256sum "$f" > "$f.sha256"
+          done
       - name: Create release
         id: create_release
         env:
@@ -482,12 +501,13 @@ jobs:
         run: |
           set -xe
           TAGNAME="${{ inputs.ffmpeg_tag || format('n{0}', needs.build_ffmpeg.outputs.detected) }}"
-          ASSET="artifacts/${{ steps.asset.outputs.base }}"
-          ASSET_SHA="${ASSET}.sha256"
+          ASSET_GLOB="artifacts/ffmpeg-n*-static.*.tar.xz"
+          ASSET_SHA_GLOB="artifacts/ffmpeg-n*-static.*.tar.xz.sha256"
           RELDATE="$(date +'%Y-%m-%d %H:%M')"
           if ! gh release view "$TAGNAME" >/dev/null 2>&1; then
-            gh release create "$TAGNAME" --title "$TAGNAME" --notes "Automated build for $TAGNAME"
+            gh release create "$TAGNAME" --title "ffmpeg-$TAGNAME" --notes "Automated build for $TAGNAME"
           fi
-          gh release upload --clobber "$TAGNAME" "$ASSET" "$ASSET_SHA"
+          # shellcheck disable=SC2086
+          gh release upload --clobber "$TAGNAME" $ASSET_GLOB $ASSET_SHA_GLOB
           echo "tag_name=${TAGNAME}" >> $GITHUB_OUTPUT
           echo "rel_date=${RELDATE}" >> $GITHUB_OUTPUT
