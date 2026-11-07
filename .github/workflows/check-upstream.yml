@@ -87,7 +87,7 @@ jobs:
 
           # Also rebuild if the per-version release is missing on the fork.
           if [ "$build" != "true" ]; then
-            if ! gh release view "$latest_tag" --repo "$REPO" >/dev/null 2>&1; then
+            if ! gh release view "ffmpeg-${latest_tag#n}" --repo "$REPO" >/dev/null 2>&1; then
               echo "Release $latest_tag missing on fork; rebuilding."
               build=true
             fi
