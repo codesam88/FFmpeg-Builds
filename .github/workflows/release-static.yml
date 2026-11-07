@@ -1,0 +1,579 @@
+name: Release Static FFmpeg (amd64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_branch:
+        description: 'FFmpeg branch to build'
+        type: choice
+        options:
+          - '7.1'
+          - '8.1'
+          - '9.0'
+        default: '8.1'
+        required: false
+      ffmpeg_tag:
+        description: 'Exact upstream tag to build (e.g. n8.1.3). Empty = branch HEAD.'
+        type: string
+        default: ''
+        required: false
+      force:
+        description: 'Force rebuild even if not new (debug)'
+        type: boolean
+        default: false
+        required: false
+      doRelease:
+        description: 'Publish new release'
+        type: boolean
+        default: true
+        required: false
+  workflow_call:
+    inputs:
+      ffmpeg_branch:
+        description: 'FFmpeg branch to build'
+        type: string
+        default: '8.1'
+        required: false
+      ffmpeg_tag:
+        description: 'Exact upstream tag to build (e.g. n8.1.3). Empty = branch HEAD.'
+        type: string
+        default: ''
+        required: false
+      force:
+        description: 'Force rebuild even if not new (debug)'
+        type: boolean
+        default: false
+        required: false
+      doRelease:
+        description: 'Publish new release'
+        type: boolean
+        default: true
+        required: false
+permissions:
+  contents: write
+  packages: write
+
+env:
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  build_base:
+    name: Build base image
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86
+            docker_tag_suffix: -x86
+          - runner: ubuntu-26.04-arm
+            arch: arm64
+            docker_tag_suffix: -arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      ARCH: ${{ matrix.arch }}
+      DOCKER_TAG_SUFFIX: ${{ matrix.docker_tag_suffix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Free Disk-Space
+        run: ./util/free_disk_space.sh
+      - name: Install buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config: .github/buildkit.toml
+      - name: Login to Docker
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Image Name
+        id: imagename
+        run: |
+          IMG="${GITHUB_REPOSITORY,,}/base"
+          IMG="${IMG// /-}"
+          echo "name=ghcr.io/${IMG}" >> $GITHUB_OUTPUT
+      - name: Stop Commands
+        run: T="$(echo -n ${{ github.token }} | sha256sum | head -c 64)" && echo -e "::add-mask::${T}\n::stop-commands::${T}"
+      - name: Patch openapv override (runtime)
+        run: |
+          set -e
+          f=scripts.d/50-openapv.sh
+          # Pin SCRIPT_COMMIT to pre-1.x for n8.1.3 exact-tag builds (1-arg oapvm_create API)
+          sed -i 's/^SCRIPT_COMMIT=.*/SCRIPT_COMMIT="9f6fd2a7369db90acec67d99fc57724f1136fb84"  # pre-1.x for n8.1.3 exact-tag builds (1-arg oapvm_create)/' "$f"
+          # Apply layout normalize (mv lib/oapv/liboapv.a + sed pc) per bf11188
+          python3 - "$f" <<'PY'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          old = """    rm -rf "$FFBUILD_DESTPREFIX"/{bin,lib/oapv,lib/import,include/oapv/oapv_exports.h,lib/liboapv.so*}
+
+              {
+                  echo "Libs.private: -lm"
+                  echo "Cflags.private: -DOAPV_STATIC_DEFINE"
+              } >> "$FFBUILD_DESTPREFIX"/lib/pkgconfig/oapv.pc
+          """
+          new = """    if [[ -f "$FFBUILD_DESTPREFIX"/lib/oapv/liboapv.a ]]; then
+                  mv "$FFBUILD_DESTPREFIX"/lib/oapv/liboapv.a "$FFBUILD_DESTPREFIX"/lib/liboapv.a
+              fi
+
+              sed -i \\
+                  -e 's#\\(includedir=.*\\)/oapv#\\1#' \\
+                  -e 's#^Libs\\.private:.*#Libs.private: -lm#' \\
+                  "$FFBUILD_DESTPREFIX"/lib/pkgconfig/oapv.pc
+
+              rm -rf "$FFBUILD_DESTPREFIX"/{bin,lib/oapv,lib/import,include/oapv/oapv_exports.h,lib/liboapv.so*}
+          """
+          if old in s:
+              s = s.replace(old, new)
+          open(p, "w").write(s)
+          PY
+      - name: Build target base image
+        uses: docker/build-push-action@v7
+        with:
+          context: images/base
+          pull: true
+          push: true
+          provenance: false
+          tags: ${{ steps.imagename.outputs.name }}:latest-${{ env.ARCH }}
+          cache-to: type=registry,mode=max,ref=${{ steps.imagename.outputs.name }}:cache-${{ env.ARCH }}
+          cache-from: type=registry,ref=${{ steps.imagename.outputs.name }}:cache-${{ env.ARCH }}
+      - name: Record image
+        uses: ./.github/actions/record-image
+        with:
+          image: ${{ steps.imagename.outputs.name }}
+          arch: ${{ env.ARCH }}
+          stage: base
+      - name: Get download cache key
+        id: dl_cache
+        run: |
+          echo "dltagname=$(./util/get_dl_cache_tag.sh)" >> $GITHUB_OUTPUT
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: .cache/downloads
+          key: download-cache-${{ steps.dl_cache.outputs.dltagname }}
+          restore-keys: |
+            download-cache-
+      - name: Update Cache
+        run: |
+          set -e
+          ./download.sh
+          ./util/clean_cache.sh
+          tar czf .cache/cache.tar.gz .cache/downloads/*
+
+  merge_base:
+    name: Merge base image
+    needs: build_base
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Login to Docker
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Merge images
+        id: merge
+        uses: ./.github/actions/merge-images-fork
+        with:
+          stage: base
+      - name: Package Names
+        id: pkgs
+        env:
+          IMAGES: ${{ steps.merge.outputs.images }}
+        run: |
+          PKGS=()
+          for IMG in $IMAGES; do
+            PKGS+=("${IMG#ghcr.io/*/}")
+          done
+          echo "names=$(IFS=,; echo "${PKGS[*]}")" >> $GITHUB_OUTPUT
+      - name: Cleanup
+        if: ${{ steps.pkgs.outputs.names != '' }}
+        continue-on-error: true
+        uses: BtbN/delete-untagged-ghcr-action@main
+        with:
+          token: ${{ github.token }}
+          package_name: ${{ steps.pkgs.outputs.names }}
+          repository_owner: ${{ github.repository_owner }}
+          repository: ${{ github.repository }}
+          owner_type: user
+          untagged_only: true
+
+  build_target_bases:
+    name: Build target base image
+    needs: [build_base, merge_base]
+    runs-on: ubuntu-latest
+    env:
+      ARCH: x86
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux64, linuxarm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Free Disk-Space
+        run: ./util/free_disk_space.sh
+      - name: Install buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config: .github/buildkit.toml
+      - name: Login to Docker
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Image Name
+        id: imagename
+        run: |
+          IMG="${GITHUB_REPOSITORY,,}/base-${{ matrix.target }}"
+          IMG="${IMG// /-}"
+          echo "name=ghcr.io/${IMG}" >> $GITHUB_OUTPUT
+          echo "gh_repo=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+      - name: Stop Commands
+        run: T="$(echo -n ${{ github.token }} | sha256sum | head -c 64)" && echo -e "::add-mask::${T}\n::stop-commands::${T}"
+      - name: Build target base image
+        uses: docker/build-push-action@v7
+        with:
+          context: images/base-${{ matrix.target }}
+          pull: true
+          push: true
+          provenance: false
+          tags: ${{ steps.imagename.outputs.name }}:latest-${{ env.ARCH }}
+          cache-to: type=registry,mode=max,ref=${{ steps.imagename.outputs.name }}:cache-${{ env.ARCH }}
+          cache-from: type=registry,ref=${{ steps.imagename.outputs.name }}:cache-${{ env.ARCH }}
+          build-args: |
+            GH_REPO=ghcr.io/${{ steps.imagename.outputs.gh_repo }}
+      - name: Record image
+        uses: ./.github/actions/record-image
+        with:
+          image: ${{ steps.imagename.outputs.name }}
+          arch: ${{ env.ARCH }}
+          stage: targetbase
+
+  merge_target_bases:
+    name: Merge target base images
+    needs: build_target_bases
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Login to Docker
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Merge images
+        id: merge
+        uses: ./.github/actions/merge-images-fork
+        with:
+          stage: targetbase
+      - name: Package Names
+        id: pkgs
+        env:
+          IMAGES: ${{ steps.merge.outputs.images }}
+        run: |
+          PKGS=()
+          for IMG in $IMAGES; do
+            PKGS+=("${IMG#ghcr.io/*/}")
+          done
+          echo "names=$(IFS=,; echo "${PKGS[*]}")" >> $GITHUB_OUTPUT
+      - name: Cleanup
+        if: ${{ steps.pkgs.outputs.names != '' }}
+        continue-on-error: true
+        uses: BtbN/delete-untagged-ghcr-action@main
+        with:
+          token: ${{ github.token }}
+          package_name: ${{ steps.pkgs.outputs.names }}
+          repository_owner: ${{ github.repository_owner }}
+          repository: ${{ github.repository }}
+          owner_type: user
+          untagged_only: true
+
+  build_targets:
+    name: Build target-variant image
+    needs: [build_target_bases, merge_target_bases]
+    runs-on: ubuntu-latest
+    env:
+      ARCH: x86
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux64, linuxarm64]
+        branch: ['${{ inputs.ffmpeg_branch }}']
+    steps:
+      - name: Validate ffmpeg_branch
+        run: |
+          case "${{ inputs.ffmpeg_branch }}" in
+            7.1|8.1|9.0) ;;
+            *) echo "Invalid ffmpeg_branch: ${{ inputs.ffmpeg_branch }}" >&2; exit 1 ;;
+          esac
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Free Disk-Space
+        run: ./util/free_disk_space.sh
+      - name: Install buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config: .github/buildkit.toml
+      - name: Login to Docker
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Image Name
+        id: imagename
+        run: |
+          IMG="${GITHUB_REPOSITORY,,}/${{ matrix.target }}-gpl-${{ matrix.branch }}"
+          IMG="${IMG// /-}"
+          echo "name=ghcr.io/${IMG}" >> $GITHUB_OUTPUT
+      - name: Get download cache key
+        id: dl_cache
+        run: |
+          echo "dltagname=$(./util/get_dl_cache_tag.sh)" >> $GITHUB_OUTPUT
+      - name: Stop Commands
+        run: T="$(echo -n ${{ github.token }} | sha256sum | head -c 64)" && echo -e "::add-mask::${T}\n::stop-commands::${T}"
+      - name: Patch openapv override (runtime)
+        run: |
+          set -e
+          f=scripts.d/50-openapv.sh
+          # Pin SCRIPT_COMMIT to pre-1.x for n8.1.3 exact-tag builds (1-arg oapvm_create API)
+          sed -i 's/^SCRIPT_COMMIT=.*/SCRIPT_COMMIT="9f6fd2a7369db90acec67d99fc57724f1136fb84"  # pre-1.x for n8.1.3 exact-tag builds (1-arg oapvm_create)/' "$f"
+          # Apply layout normalize (mv lib/oapv/liboapv.a + sed pc) per bf11188
+          python3 - "$f" <<'PY'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          old = """    rm -rf "$FFBUILD_DESTPREFIX"/{bin,lib/oapv,lib/import,include/oapv/oapv_exports.h,lib/liboapv.so*}
+
+              {
+                  echo "Libs.private: -lm"
+                  echo "Cflags.private: -DOAPV_STATIC_DEFINE"
+              } >> "$FFBUILD_DESTPREFIX"/lib/pkgconfig/oapv.pc
+          """
+          new = """    if [[ -f "$FFBUILD_DESTPREFIX"/lib/oapv/liboapv.a ]]; then
+                  mv "$FFBUILD_DESTPREFIX"/lib/oapv/liboapv.a "$FFBUILD_DESTPREFIX"/lib/liboapv.a
+              fi
+
+              sed -i \\
+                  -e 's#\\(includedir=.*\\)/oapv#\\1#' \\
+                  -e 's#^Libs\\.private:.*#Libs.private: -lm#' \\
+                  "$FFBUILD_DESTPREFIX"/lib/pkgconfig/oapv.pc
+
+              rm -rf "$FFBUILD_DESTPREFIX"/{bin,lib/oapv,lib/import,include/oapv/oapv_exports.h,lib/liboapv.so*}
+          """
+          if old in s:
+              s = s.replace(old, new)
+          open(p, "w").write(s)
+          PY
+      - name: Generate Dockerfile
+        run: ./generate.sh ${{ matrix.target }} gpl ${{ matrix.branch }}
+      - name: Cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .cache/downloads
+          key: download-cache-${{ steps.dl_cache.outputs.dltagname }}
+          fail-on-cache-miss: true
+      - name: Build target base image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          pull: true
+          push: true
+          provenance: false
+          tags: ${{ steps.imagename.outputs.name }}:latest-${{ env.ARCH }}
+          cache-to: type=registry,mode=max,ref=${{ steps.imagename.outputs.name }}:cache-${{ env.ARCH }}
+          cache-from: type=registry,ref=${{ steps.imagename.outputs.name }}:cache-${{ env.ARCH }}
+      - name: Record image
+        uses: ./.github/actions/record-image
+        with:
+          image: ${{ steps.imagename.outputs.name }}
+          arch: ${{ env.ARCH }}
+          stage: variant
+
+  merge_targets:
+    name: Merge target-variant images
+    needs: build_targets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Login to Docker
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Merge images
+        id: merge
+        uses: ./.github/actions/merge-images-fork
+        with:
+          stage: variant
+      - name: Package Names
+        id: pkgs
+        env:
+          IMAGES: ${{ steps.merge.outputs.images }}
+        run: |
+          PKGS=()
+          for IMG in $IMAGES; do
+            PKGS+=("${IMG#ghcr.io/*/}")
+          done
+          echo "names=$(IFS=,; echo "${PKGS[*]}")" >> $GITHUB_OUTPUT
+      - name: Cleanup
+        if: ${{ steps.pkgs.outputs.names != '' }}
+        continue-on-error: true
+        uses: BtbN/delete-untagged-ghcr-action@main
+        with:
+          token: ${{ github.token }}
+          package_name: ${{ steps.pkgs.outputs.names }}
+          repository_owner: ${{ github.repository_owner }}
+          repository: ${{ github.repository }}
+          owner_type: user
+          untagged_only: true
+
+  build_ffmpeg:
+    name: Build ffmpeg
+    needs: [build_targets, merge_targets]
+    runs-on: ubuntu-latest
+    outputs:
+      detected: ${{ steps.normalize.outputs.detected }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux64, linuxarm64]
+        branch: ['${{ inputs.ffmpeg_branch }}']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Free Disk-Space
+        run: ./util/free_disk_space.sh
+      - name: Login to Docker
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build ffmpeg
+        env:
+          GIT_BRANCH_OVERRIDE: ${{ inputs.ffmpeg_tag }}
+        run: |
+          T="$(echo -n ${{ github.token }} | sha256sum | head -c 64)" && echo -e "::add-mask::${T}\n::stop-commands::${T}"
+          ./build.sh ${{ matrix.target }} gpl ${{ matrix.branch }}
+      - name: Replace spaces in string
+        id: strs
+        run: |
+          SLUG="${{ matrix.target }}-gpl-${{ matrix.branch }}"
+          echo "artifact_slug=${SLUG// /-}" >> $GITHUB_OUTPUT
+      - name: Detect and normalize artifact
+        id: normalize
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(artifacts/*.tar.xz)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No tar.xz artifact found" >&2
+            exit 1
+          fi
+          f="${files[0]}"
+          base="$(basename "$f")"
+          if [[ "$base" =~ ffmpeg-(n[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            ver="${BASH_REMATCH[1]}"
+          else
+            echo "Could not detect nX.Y.Z from $base" >&2
+            exit 1
+          fi
+          case "${{ matrix.target }}" in
+            linux64) arch=amd64 ;;
+            linuxarm64) arch=arm64 ;;
+            *) echo "Unknown target ${{ matrix.target }}" >&2; exit 1 ;;
+          esac
+          num="${ver#n}"
+          new="artifacts/ffmpeg-${ver}-static.${arch}.tar.xz"
+          if [[ "$f" != "$new" ]]; then
+            mv "$f" "$new"
+          fi
+          echo "detected=$num" >> $GITHUB_OUTPUT
+          echo "asset=$new" >> $GITHUB_OUTPUT
+          echo "version=$ver" >> $GITHUB_OUTPUT
+          echo "arch=$arch" >> $GITHUB_OUTPUT
+          echo "Mapping: input_tag=${{ inputs.ffmpeg_tag }} built=$ver detected_num=$num asset=$(basename "$new") tagname=n${num}"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-${{ steps.strs.outputs.artifact_slug }}
+          overwrite: true
+          retention-days: 3
+          path: artifacts/*
+
+  publish_release:
+    name: Publish release
+    if: ${{ !cancelled() && (inputs.doRelease == true || github.event.inputs.doRelease == 'true' || inputs.force == true) && needs.build_ffmpeg.result == 'success' }}
+    needs: build_ffmpeg
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libarchive-tools p7zip-full
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Free Disk-Space
+        run: ./util/free_disk_space.sh
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ffmpeg-*
+          merge-multiple: true
+          path: artifacts
+      - name: Detect version
+        id: asset
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(artifacts/ffmpeg-n*-static.*.tar.xz)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No normalized asset found" >&2
+            exit 1
+          fi
+          f="${files[0]}"
+          base="$(basename "$f")"
+          if [[ "$base" =~ ffmpeg-(n[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            ver="${BASH_REMATCH[1]}"
+          else
+            echo "Could not detect version from $base" >&2
+            exit 1
+          fi
+          num="${ver#n}"
+          echo "version=$ver" >> $GITHUB_OUTPUT
+          echo "num=$num" >> $GITHUB_OUTPUT
+          echo "Mapping: assets=${files[*]} tagname=${{ inputs.ffmpeg_tag || format('n{0}', needs.build_ffmpeg.outputs.detected) }}"
+      - name: Create checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          shopt -s nullglob
+          for f in ffmpeg-n*-static.*.tar.xz; do
+            sha256sum "$f" > "$f.sha256"
+          done
+      - name: Create release
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -xe
+          TAGNAME="${{ inputs.ffmpeg_tag || format('n{0}', needs.build_ffmpeg.outputs.detected) }}"
+          ASSET_GLOB="artifacts/ffmpeg-n*-static.*.tar.xz"
+          ASSET_SHA_GLOB="artifacts/ffmpeg-n*-static.*.tar.xz.sha256"
+          RELDATE="$(date +'%Y-%m-%d %H:%M')"
+          if ! gh release view "$TAGNAME" >/dev/null 2>&1; then
+            gh release create "$TAGNAME" --title "ffmpeg-$TAGNAME" --notes "Automated build for $TAGNAME"
+          fi
+          # shellcheck disable=SC2086
+          gh release upload --clobber "$TAGNAME" $ASSET_GLOB $ASSET_SHA_GLOB
+          echo "tag_name=${TAGNAME}" >> $GITHUB_OUTPUT
+          echo "rel_date=${RELDATE}" >> $GITHUB_OUTPUT
