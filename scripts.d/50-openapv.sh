@@ -1,7 +1,7 @@
 #!/bin/bash
 
 SCRIPT_REPO="https://github.com/AcademySoftwareFoundation/openapv.git"
-SCRIPT_COMMIT="b4ff69856b4c3e8849df431ee3db54fd535f9bf3"
+SCRIPT_COMMIT="9f6fd2a7369db90acec67d99fc57724f1136fb84"  # pre-1.x for n8.1.3 exact-tag builds (1-arg oapvm_create)
 
 ffbuild_enabled() {
     (( $(ffbuild_ffver) > 701 )) || return -1
