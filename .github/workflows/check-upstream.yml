@@ -1,0 +1,157 @@
+name: Check upstream FFmpeg releases
+
+# Upstream FFmpeg release tag check (n<version>).
+# When a new n-tag is found (or a rebuild is forced), it triggers
+# release-static.yml for that branch with doRelease=true.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to check (or all)'
+        type: choice
+        options:
+          - '7.1'
+          - '8.1'
+          - '9.0'
+          - 'all'
+        default: 'all'
+        required: false
+      dry_run:
+        description: 'Dry run: print plan only, no dispatch'
+        type: boolean
+        default: true
+        required: false
+      force:
+        description: 'Force rebuild of current releases (debug)'
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  check:
+    name: Check upstream branch ${{ matrix.branch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        branch: ['7.1', '8.1', '9.0']
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      FORCE: ${{ inputs.force || false }}
+      DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run == true) && 'true' || 'false' }}
+      BRANCH_FILTER: ${{ inputs.branch || 'all' }}
+    steps:
+      - name: Compare upstream tags to last-seen variables
+        env:
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          set -euo pipefail
+
+          if [ "${BRANCH_FILTER}" != "all" ] && [ "${BRANCH}" != "${BRANCH_FILTER}" ]; then
+            echo "Branch ${BRANCH} not selected (${BRANCH_FILTER}); skipping."
+            exit 0
+          fi
+
+          PRIMARY_URL="https://github.com/FFmpeg/FFmpeg.git"
+          FALLBACK_URL="https://github.com/BtbN/ffmpeg.git"
+
+          SUFFIX="${BRANCH//./}"
+          VAR="LAST_SEEN_${SUFFIX}"
+
+          URL="$PRIMARY_URL"
+          REMOTE_OUTPUT="$(timeout 60 git ls-remote "$URL" "refs/tags/n${BRANCH}.*" 2>/dev/null || true)"
+          if [ -z "$REMOTE_OUTPUT" ]; then
+            echo "Primary upstream unreachable/empty; trying fallback mirror."
+            URL="$FALLBACK_URL"
+            REMOTE_OUTPUT="$(timeout 60 git ls-remote "$URL" "refs/tags/n${BRANCH}.*" 2>/dev/null || true)"
+          fi
+          if [ -z "$REMOTE_OUTPUT" ]; then
+            echo "::error::Both upstream sources unreachable."
+            exit 1
+          fi
+          echo "Using upstream source: $URL"
+
+          # Keep latest only (gaps are ok; manual trigger for specifics).
+          latest_tag="$(printf '%s\n' "$REMOTE_OUTPUT" \
+            | sed 's/.*refs\/tags\///' \
+            | sed 's/\^{}//' \
+            | grep -E "^n${BRANCH//./\\.}\\." \
+            | sort -Vu \
+            | tail -n 1)"
+          if [ -z "$latest_tag" ]; then
+            echo "No n-tags found for branch ${BRANCH}; skipping."
+            exit 0
+          fi
+          echo "Latest upstream tag: $latest_tag"
+
+          old="$(gh variable get "$VAR" --repo "$REPO" 2>/dev/null || true)"
+
+          build=false
+          if [ "${FORCE}" = "true" ]; then
+            echo "Force rebuild requested."
+            build=true
+          elif [ -z "$old" ] || [ "$old" != "$latest_tag" ]; then
+            echo "New tag detected (${old:-<unset>} -> $latest_tag)."
+            build=true
+          else
+            echo "No new tag (last seen: $old)."
+          fi
+
+          # Also rebuild if the per-version release is missing on the fork.
+          release_exists=false
+          if gh release view "$latest_tag" --repo "$REPO" >/dev/null 2>&1; then
+            release_exists=true
+          fi
+          if [ "$build" != "true" ] && [ "$release_exists" != "true" ]; then
+            echo "Release $latest_tag missing on fork; rebuilding."
+            build=true
+          fi
+
+          # Dry run: print plan table and exit without dispatch.
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "| branch | latest upstream | last seen | release exists | would dispatch |"
+            echo "|---|---|---|---|---|"
+            if [ "$build" = "true" ]; then
+              wd="yes"
+            else
+              wd="no"
+            fi
+            echo "| ${BRANCH} | ${latest_tag} | ${old:-<unset>} | ${release_exists} | ${wd} |"
+            exit 0
+          fi
+
+          if [ "$build" != "true" ]; then
+            echo "Skipping build for ${BRANCH}."
+            exit 0
+          fi
+
+          echo "Triggering release-static.yml for ${BRANCH} (${latest_tag})..."
+          gh workflow run release-static.yml \
+            --repo "$REPO" --ref master \
+            -f "ffmpeg_branch=${BRANCH}" \
+            -f "ffmpeg_tag=${latest_tag}" \
+            -f "force=${FORCE}" \
+            -f "doRelease=true"
+
+          # Wait for the triggered run to finish to keep builds serial.
+          run_id=""
+          for _ in $(seq 1 30); do
+            run_id="$(gh run list --repo "$REPO" --workflow release-static.yml --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
+            [ -n "$run_id" ] && break
+            sleep 5
+          done
+          if [ -n "$run_id" ]; then
+            echo "Watching run $run_id"
+            gh run watch "$run_id" --repo "$REPO" --exit-status || echo "Build run did not succeed."
+          fi
+
+          gh variable set "$VAR" --body "$latest_tag" --repo "$REPO"
