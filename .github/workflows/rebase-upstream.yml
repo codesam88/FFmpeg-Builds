@@ -1,0 +1,110 @@
+name: Rebase fork onto upstream (PR)
+
+# Weekly (Monday 05:00 UTC) rebase of the fork's master onto upstream master,
+# delivered as a pull request (never auto-merged). The fork carries only a few
+# fork-only paths; this workflow replays them on top of upstream master.
+
+on:
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rebase:
+    name: Rebase upstream master
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork master
+        uses: actions/checkout@v7
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Configure git
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Add read-only upstream remote (fetch only)
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/BtbN/FFmpeg-Builds.git
+          git remote set-url --push upstream no_push
+          git fetch upstream master
+      - name: Guard fork-only diff + build.yml + openapv override
+        run: |
+          set -euo pipefail
+          # Working tree must be clean.
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Working tree not clean; aborting."
+            exit 1
+          fi
+          # Fork diff vs upstream must be only the known fork-only paths.
+          bad=0
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              .github/workflows/release-static.yml) ;;
+              .github/workflows/check-upstream.yml) ;;
+              .github/workflows/rebase-upstream.yml) ;;
+              .github/actions/merge-images-fork/*) ;;
+              *) echo "Unexpected fork-only diff path: $f"; bad=1 ;;
+            esac
+          done < <(git diff --name-only upstream/master)
+          if [ "$bad" -ne 0 ]; then
+            echo "Fork diff contains unexpected paths; failing."
+            exit 1
+          fi
+          # Guard: build.yml must be identical to upstream.
+          if ! git diff --exit-code upstream/master -- build.yml >/dev/null 2>&1; then
+            echo "Guard failed: build.yml differs from upstream."
+            exit 1
+          fi
+          # Guard: openapv effective pin via runtime override must be present.
+          if ! grep -q "Patch openapv override (runtime)" .github/workflows/release-static.yml; then
+            echo "Guard failed: openapv runtime override step missing."
+            exit 1
+          fi
+          if ! grep -q "9f6fd2a7369db90acec67d99fc57724f1136fb84" .github/workflows/release-static.yml; then
+            echo "Guard failed: openapv pin missing."
+            exit 1
+          fi
+          echo "Guards passed."
+      - name: Create sync branch and rebase
+        run: |
+          set -euo pipefail
+          shortsha="$(git rev-parse --short upstream/master)"
+          datestr="$(date -u +%Y%m%d)"
+          branch="sync/upstream-${datestr}-${shortsha}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          git checkout -b "$branch"
+          if ! git rebase upstream/master; then
+            echo "Rebase failed (conflict). Aborting."
+            git rebase --abort || true
+            exit 1
+          fi
+          # Re-assert clean tree after rebase.
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Working tree not clean after rebase."
+            exit 1
+          fi
+          echo "Rebased onto upstream/master successfully."
+        id: rebase
+      - name: Push branch only
+        run: |
+          set -euo pipefail
+          git push origin "${{ steps.rebase.outputs.branch }}"
+      - name: Create pull request (no auto-merge)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh pr create \
+            --base master \
+            --head "${{ steps.rebase.outputs.branch }}" \
+            --title "Sync upstream master (${{ steps.rebase.outputs.branch }})" \
+            --body "Automated rebase of fork onto upstream master. No auto-merge; review and merge manually."

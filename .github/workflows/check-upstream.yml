@@ -1,8 +1,17 @@
 name: Check upstream FFmpeg releases
 
 # Upstream FFmpeg release tag check (n<version>).
+# Tracks MAJORS 7/8/9 (not pinned minors): latest = n<major>.* newest tag,
+# so new minors (e.g. n7.1.6, n8.2.0, n9.1.0) trigger automatically.
 # When a new n-tag is found (or a rebuild is forced), it triggers
 # release-static.yml for that branch with doRelease=true.
+#
+# Rotation (stateless, one build per day max):
+#   today_pick = day-of-year (UTC, 1-based) % 3  ->  0:7, 1:8, 2:9
+#   auto (default): evaluate only today's major.
+#   all: evaluate in rotation order starting today_pick, dispatch first needing.
+#   explicit 7/8/9: evaluate that major only.
+# At most one build is dispatched per run.
 
 on:
   schedule:
@@ -10,14 +19,15 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Branch to check (or all)'
+        description: 'Major to check (auto = today rotation, 7/8/9, or all)'
         type: choice
         options:
-          - '7.1'
-          - '8.1'
-          - '9.0'
+          - 'auto'
+          - '7'
+          - '8'
+          - '9'
           - 'all'
-        default: 'all'
+        default: 'auto'
         required: false
       dry_run:
         description: 'Dry run: print plan only, no dispatch'
@@ -36,126 +46,172 @@ permissions:
 
 jobs:
   check:
-    name: Check upstream branch ${{ matrix.branch }}
+    name: Check upstream major (rotation)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        branch: ['7.1', '8.1', '9.0']
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       FORCE: ${{ inputs.force || false }}
       DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run == true) && 'true' || 'false' }}
-      BRANCH_FILTER: ${{ inputs.branch || 'all' }}
+      BRANCH_FILTER: ${{ inputs.branch || 'auto' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Compare upstream tags to fork releases
-        env:
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ matrix.branch }}
+      - name: Select branch(es) to evaluate
+        id: select
         run: |
           set -euo pipefail
-
-          if [ "${BRANCH_FILTER}" != "all" ] && [ "${BRANCH}" != "${BRANCH_FILTER}" ]; then
-            echo "Branch ${BRANCH} not selected (${BRANCH_FILTER}); skipping."
-            exit 0
+          # Day-of-year (UTC, 1-based) modulo 3: 0->major 7, 1->8, 2->9
+          doy="$(date -u +%j)"
+          idx=$(( 10#$doy % 3 ))
+          case "$idx" in
+            0) pick=7 ;;
+            1) pick=8 ;;
+            2) pick=9 ;;
+          esac
+          filter="${BRANCH_FILTER}"
+          if [ "$filter" = "auto" ]; then
+            candidates="$pick"
+          elif [ "$filter" = "all" ]; then
+            # rotation order starting from today's pick
+            case "$pick" in
+              7) candidates="7 8 9" ;;
+              8) candidates="8 9 7" ;;
+              9) candidates="9 7 8" ;;
+            esac
+          else
+            candidates="$filter"
           fi
+          echo "Today UTC day-of-year=$doy -> idx=$idx -> selected major=$pick."
+          echo "Candidates to evaluate: $candidates"
+          echo "today_pick=$pick" >> "$GITHUB_OUTPUT"
+          echo "candidates=$candidates" >> "$GITHUB_OUTPUT"
+      - name: Evaluate and dispatch (at most one build)
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          FORCE="${FORCE}"
+          DRY_RUN="${DRY_RUN}"
+          candidates="${{ steps.select.outputs.candidates }}"
+          today_pick="${{ steps.select.outputs.today_pick }}"
+
+          build_branch_for() {
+            case "$1" in
+              7) echo "7.1" ;;
+              8) echo "8.1" ;;
+              9) echo "9.0" ;;
+              *) echo "$1" ;;
+            esac
+          }
 
           PRIMARY_URL="https://github.com/FFmpeg/FFmpeg.git"
           FALLBACK_URL="https://github.com/BtbN/ffmpeg.git"
 
-          URL="$PRIMARY_URL"
-          REMOTE_OUTPUT="$(timeout 60 git ls-remote "$URL" "refs/tags/n${BRANCH}.*" 2>/dev/null || true)"
-          if [ -z "$REMOTE_OUTPUT" ]; then
-            echo "Primary upstream unreachable/empty; trying fallback mirror."
-            URL="$FALLBACK_URL"
-            REMOTE_OUTPUT="$(timeout 60 git ls-remote "$URL" "refs/tags/n${BRANCH}.*" 2>/dev/null || true)"
-          fi
-          if [ -z "$REMOTE_OUTPUT" ]; then
-            echo "::error::Both upstream sources unreachable."
-            exit 1
-          fi
-          echo "Using upstream source: $URL"
-
-          # Keep latest only (gaps are ok; manual trigger for specifics).
-          latest_tag="$(printf '%s\n' "$REMOTE_OUTPUT" \
-            | sed 's/.*refs\/tags\///' \
-            | sed 's/\^{}//' \
-            | grep -E "^n${BRANCH//./\\.}\\." \
-            | sort -Vu \
-            | tail -n 1)"
-          if [ -z "$latest_tag" ]; then
-            echo "No n-tags found for branch ${BRANCH}; skipping."
-            exit 0
-          fi
-          echo "Latest upstream tag: $latest_tag"
-
-          # Current fork/upstream base + toolchain marker (checker runtime).
           current_base="$(git ls-remote https://github.com/BtbN/FFmpeg-Builds.git HEAD | awk '{print $1}')"
           current_marker="$(sha256sum scripts.d/50-openapv.sh images/base/Dockerfile)"
 
-          release_exists=false
-          if gh release view "$latest_tag" --repo "$REPO" >/dev/null 2>&1; then
-            release_exists=true
-          fi
+          results_file="$(mktemp)"
+          chosen_major=""
+          chosen_tag=""
+          chosen_reason=""
+          for major in $candidates; do
+            echo "=== Evaluating major $major ==="
+            URL="$PRIMARY_URL"
+            REMOTE_OUTPUT="$(timeout 60 git ls-remote "$URL" "refs/tags/n${major}.*" 2>/dev/null || true)"
+            if [ -z "$REMOTE_OUTPUT" ]; then
+              echo "Primary upstream unreachable/empty; trying fallback mirror."
+              URL="$FALLBACK_URL"
+              REMOTE_OUTPUT="$(timeout 60 git ls-remote "$URL" "refs/tags/n${major}.*" 2>/dev/null || true)"
+            fi
+            if [ -z "$REMOTE_OUTPUT" ]; then
+              echo "::error::Both upstream sources unreachable for major $major."
+              exit 1
+            fi
+            latest_tag="$(printf '%s\n' "$REMOTE_OUTPUT" \
+              | sed 's/.*refs\/tags\///' \
+              | sed 's/\^{}//' \
+              | grep -E "^n${major}\\." \
+              | sort -V \
+              | tail -n 1)"
+            if [ -z "$latest_tag" ]; then
+              echo "No n-tags found for major ${major}; skipping."
+              echo "${major}|none|false|false|no-tags" >> "$results_file"
+              continue
+            fi
+            echo "Latest upstream tag: $latest_tag"
 
-          build=false
-          reason="up-to-date"
-          if [ "${FORCE}" = "true" ]; then
-            echo "Force rebuild requested."
-            build=true
-            reason="force"
-          elif [ "$release_exists" != "true" ]; then
-            echo "Release $latest_tag missing on fork; would build."
-            build=true
-            reason="missing-release"
-          else
-            # Download build-info.json and compare stored base/marker.
-            tmpdir="$(mktemp -d)"
-            stored_base=""
-            stored_marker=""
-            if gh release download "$latest_tag" --repo "$REPO" -p build-info.json -D "$tmpdir" >/dev/null 2>&1; then
-              stored_base="$(python3 -c "import json;print(json.load(open('$tmpdir/build-info.json')).get('fork_base_sha',''))" 2>/dev/null || true)"
-              stored_marker="$(python3 -c "import json;print(json.load(open('$tmpdir/build-info.json')).get('toolchain_marker',''),end='')" 2>/dev/null || true)"
+            release_exists=false
+            if gh release view "$latest_tag" --repo "$REPO" >/dev/null 2>&1; then
+              release_exists=true
             fi
-            if [ "$stored_base" != "$current_base" ]; then
-              echo "Fork base changed (${stored_base:-<none>} -> $current_base); would rebuild."
+
+            build=false
+            reason="up-to-date"
+            if [ "${FORCE}" = "true" ]; then
+              echo "Force rebuild requested."
               build=true
-              reason="base-changed"
-            elif [ "$stored_marker" != "$current_marker" ]; then
-              echo "Toolchain marker changed; would rebuild."
+              reason="force"
+            elif [ "$release_exists" != "true" ]; then
+              echo "Release $latest_tag missing on fork; would build."
               build=true
-              reason="toolchain-changed"
+              reason="missing-release"
             else
-              echo "Release $latest_tag up to date."
+              tmpdir="$(mktemp -d)"
+              stored_base=""
+              stored_marker=""
+              if gh release download "$latest_tag" --repo "$REPO" -p build-info.json -D "$tmpdir" >/dev/null 2>&1; then
+                stored_base="$(python3 -c "import json;print(json.load(open('$tmpdir/build-info.json')).get('fork_base_sha',''))" 2>/dev/null || true)"
+                stored_marker="$(python3 -c "import json;print(json.load(open('$tmpdir/build-info.json')).get('toolchain_marker',''),end='')" 2>/dev/null || true)"
+              fi
+              if [ "$stored_base" != "$current_base" ]; then
+                echo "Fork base changed (${stored_base:-<none>} -> $current_base); would rebuild."
+                build=true
+                reason="base-changed"
+              elif [ "$stored_marker" != "$current_marker" ]; then
+                echo "Toolchain marker changed; would rebuild."
+                build=true
+                reason="toolchain-changed"
+              else
+                echo "Release $latest_tag up to date."
+              fi
             fi
-          fi
+
+            if [ "$build" = "true" ] && [ -z "$chosen_major" ]; then
+              chosen_major="$major"
+              chosen_tag="$latest_tag"
+              chosen_reason="$reason"
+            fi
+            if [ "$build" = "true" ]; then wd="yes"; else wd="no"; fi
+            echo "${major}|${latest_tag}|${release_exists}|${build}|${reason}|${wd}" >> "$results_file"
+          done
 
           # Dry run: print plan table and exit without dispatch.
           if [ "${DRY_RUN}" = "true" ]; then
-            echo "| branch | latest upstream | release exists | reason | would dispatch |"
+            echo ""
+            echo "| major | latest upstream | release exists | reason | would dispatch |"
             echo "|---|---|---|---|---|"
-            if [ "$build" = "true" ]; then
-              wd="yes"
+            while IFS='|' read -r major latest_tag release_exists build reason wd; do
+              echo "| ${major} | ${latest_tag} | ${release_exists} | ${reason} | ${wd} |"
+            done < "$results_file"
+            echo ""
+            if [ -n "$chosen_major" ]; then
+              echo "Decision: would build major ${chosen_major} (tag ${chosen_tag}) reason=${chosen_reason}."
             else
-              wd="no"
+              echo "Decision: idle — no major needs rebuild."
             fi
-            echo "| ${BRANCH} | ${latest_tag} | ${release_exists} | ${reason} | ${wd} |"
             exit 0
           fi
 
-          if [ "$build" != "true" ]; then
-            echo "Skipping build for ${BRANCH}."
+          if [ -z "$chosen_major" ]; then
+            echo "Idle: no major needs rebuild (today's pick was ${today_pick})."
             exit 0
           fi
 
-          echo "Triggering release-static.yml for ${BRANCH} (${latest_tag})..."
+          build_branch="$(build_branch_for "$chosen_major")"
+          echo "Triggering release-static.yml for major ${chosen_major} (branch label ${build_branch}, tag ${chosen_tag}) reason=${chosen_reason}..."
           gh workflow run release-static.yml \
             --repo "$REPO" --ref master \
-            -f "ffmpeg_branch=${BRANCH}" \
-            -f "ffmpeg_tag=${latest_tag}" \
+            -f "ffmpeg_branch=${build_branch}" \
+            -f "ffmpeg_tag=${chosen_tag}" \
             -f "force=${FORCE}" \
             -f "doRelease=true"
 
