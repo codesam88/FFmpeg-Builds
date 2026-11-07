@@ -427,7 +427,7 @@ jobs:
           echo "detected=$num" >> $GITHUB_OUTPUT
           echo "asset=$new" >> $GITHUB_OUTPUT
           echo "version=$ver" >> $GITHUB_OUTPUT
-          echo "Mapping: input_tag=${{ inputs.ffmpeg_tag }} built=$ver detected_num=$num asset=$(basename "$new") tagname=${{ inputs.ffmpeg_tag || format('n{0}', num) }}"
+          echo "Mapping: input_tag=${{ inputs.ffmpeg_tag }} built=$ver detected_num=$num asset=$(basename "$new") tagname=n${num}"
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -468,7 +468,7 @@ jobs:
           base="$(basename "$f")"
           echo "path=$f" >> $GITHUB_OUTPUT
           echo "base=$base" >> $GITHUB_OUTPUT
-          echo "Mapping: asset=$base tagname=ffmpeg-${{ needs.build_ffmpeg.outputs.detected }}"
+          echo "Mapping: asset=$base tagname=${{ inputs.ffmpeg_tag || format('n{0}', needs.build_ffmpeg.outputs.detected) }}"
       - name: Create checksum
         run: |
           set -euo pipefail
