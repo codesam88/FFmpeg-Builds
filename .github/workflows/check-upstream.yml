@@ -5,8 +5,6 @@ name: Check upstream FFmpeg releases
 # release-static.yml for that branch with doRelease=true.
 
 on:
-  schedule:
-    - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       force:
