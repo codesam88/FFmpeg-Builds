@@ -560,6 +560,58 @@ jobs:
           for f in ffmpeg-n*-static.*.tar.xz; do
             sha256sum "$f" > "$f.sha256"
           done
+      - name: Generate build info
+        id: build_info
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAGNAME="${{ inputs.ffmpeg_tag || format('n{0}', needs.build_ffmpeg.outputs.detected) }}"
+          if [ -z "$TAGNAME" ]; then
+            TAGNAME="n${{ steps.asset.outputs.num }}"
+          fi
+          python3 - "$TAGNAME" <<'PY'
+          import json, os, subprocess, sys
+          tag = sys.argv[1]
+          def ls_remote(url, ref):
+              out = subprocess.check_output(["git", "ls-remote", url, ref], text=True).strip().split()
+              return out[0] if out else ""
+          ffmpeg_sha = ls_remote("https://github.com/FFmpeg/FFmpeg.git", f"refs/tags/{tag}^{{}}")
+          fork_base_sha = ls_remote("https://github.com/BtbN/FFmpeg-Builds.git", "HEAD")
+          openapv_pin = ""
+          try:
+              for line in open("scripts.d/50-openapv.sh").read().splitlines():
+                  if line.strip().startswith("SCRIPT_COMMIT="):
+                      openapv_pin = line.strip()
+                      break
+          except FileNotFoundError:
+              openapv_pin = ""
+          marker = subprocess.check_output(
+              ["sha256sum", "scripts.d/50-openapv.sh", "images/base/Dockerfile"], text=True
+          )
+          data = {
+              "ffmpeg_tag": tag,
+              "ffmpeg_sha": ffmpeg_sha,
+              "fork_base_sha": fork_base_sha,
+              "openapv_pin": openapv_pin,
+              "toolchain_marker": marker,
+              "github_sha": os.environ.get("GITHUB_SHA", ""),
+          }
+          os.makedirs("artifacts", exist_ok=True)
+          with open("artifacts/build-info.json", "w") as f:
+              json.dump(data, f, indent=2)
+              f.write("\n")
+          with open("artifacts/build-info.txt", "w") as f:
+              f.write(f"ffmpeg_tag: {tag}\n")
+              f.write(f"ffmpeg_sha: {ffmpeg_sha}\n")
+              f.write(f"fork_base_sha: {fork_base_sha}\n")
+              f.write(f"openapv_pin: {openapv_pin}\n")
+              f.write(f"github_sha: {os.environ.get('GITHUB_SHA', '')}\n")
+              f.write("toolchain_marker:\n")
+              f.write(marker)
+          print(json.dumps(data, indent=2))
+          PY
+          echo "tag_name=$TAGNAME" >> $GITHUB_OUTPUT
       - name: Create release
         id: create_release
         env:
@@ -567,6 +619,9 @@ jobs:
         run: |
           set -xe
           TAGNAME="${{ inputs.ffmpeg_tag || format('n{0}', needs.build_ffmpeg.outputs.detected) }}"
+          if [ -z "$TAGNAME" ]; then
+            TAGNAME="n${{ steps.asset.outputs.num }}"
+          fi
           ASSET_GLOB="artifacts/ffmpeg-n*-static.*.tar.xz"
           ASSET_SHA_GLOB="artifacts/ffmpeg-n*-static.*.tar.xz.sha256"
           RELDATE="$(date +'%Y-%m-%d %H:%M')"
@@ -574,6 +629,12 @@ jobs:
             gh release create "$TAGNAME" --title "ffmpeg-$TAGNAME" --notes "Automated build for $TAGNAME"
           fi
           # shellcheck disable=SC2086
-          gh release upload --clobber "$TAGNAME" $ASSET_GLOB $ASSET_SHA_GLOB
+          gh release upload --clobber "$TAGNAME" $ASSET_GLOB $ASSET_SHA_GLOB artifacts/build-info.json artifacts/build-info.txt
+          # Embed key lines in release notes
+          NOTES="Automated build for $TAGNAME"$'\n'
+          NOTES+="ffmpeg_tag: $TAGNAME"$'\n'
+          NOTES+="ffmpeg_sha: $(python3 -c 'import json;print(json.load(open("artifacts/build-info.json"))["ffmpeg_sha"])')"$'\n'
+          NOTES+="fork_base_sha: $(python3 -c 'import json;print(json.load(open("artifacts/build-info.json"))["fork_base_sha"])')"$'\n'
+          gh release edit "$TAGNAME" --notes "$NOTES" || true
           echo "tag_name=${TAGNAME}" >> $GITHUB_OUTPUT
           echo "rel_date=${RELDATE}" >> $GITHUB_OUTPUT
