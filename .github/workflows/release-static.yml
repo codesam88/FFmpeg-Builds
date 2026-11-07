@@ -420,14 +420,14 @@ jobs:
             exit 1
           fi
           num="${ver#n}"
-          new="artifacts/ffmpeg-${num}-static.amd64.tar.xz"
+          new="artifacts/ffmpeg-${ver}-static.amd64.tar.xz"
           if [[ "$f" != "$new" ]]; then
             mv "$f" "$new"
           fi
           echo "detected=$num" >> $GITHUB_OUTPUT
           echo "asset=$new" >> $GITHUB_OUTPUT
           echo "version=$ver" >> $GITHUB_OUTPUT
-          echo "Mapping: input_tag=${{ inputs.ffmpeg_tag }} built=$ver detected_num=$num asset=$(basename "$new") tagname=ffmpeg-${num}"
+          echo "Mapping: input_tag=${{ inputs.ffmpeg_tag }} built=$ver detected_num=$num asset=$(basename "$new") tagname=${{ inputs.ffmpeg_tag || format('n{0}', num) }}"
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -459,7 +459,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(artifacts/ffmpeg-[0-9]*-static.amd64.tar.xz)
+          files=(artifacts/ffmpeg-n*-static.amd64.tar.xz)
           if [[ ${#files[@]} -eq 0 ]]; then
             echo "No normalized asset found" >&2
             exit 1
@@ -481,7 +481,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -xe
-          TAGNAME="ffmpeg-${{ needs.build_ffmpeg.outputs.detected }}"
+          TAGNAME="${{ inputs.ffmpeg_tag || format('n{0}', needs.build_ffmpeg.outputs.detected) }}"
           ASSET="artifacts/${{ steps.asset.outputs.base }}"
           ASSET_SHA="${ASSET}.sha256"
           RELDATE="$(date +'%Y-%m-%d %H:%M')"
