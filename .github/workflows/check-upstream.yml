@@ -37,7 +37,6 @@ jobs:
   check:
     name: Check upstream branch ${{ matrix.branch }}
     runs-on: ubuntu-latest
-    if: ${{ inputs.branch == 'all' || inputs.branch == matrix.branch }}
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -55,6 +54,11 @@ jobs:
           BRANCH: ${{ matrix.branch }}
         run: |
           set -euo pipefail
+
+          if [ "${BRANCH_FILTER}" != "all" ] && [ "${BRANCH}" != "${BRANCH_FILTER}" ]; then
+            echo "Branch ${BRANCH} not selected (${BRANCH_FILTER}); skipping."
+            exit 0
+          fi
 
           PRIMARY_URL="https://github.com/FFmpeg/FFmpeg.git"
           FALLBACK_URL="https://github.com/BtbN/ffmpeg.git"
