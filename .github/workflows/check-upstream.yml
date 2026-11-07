@@ -1,10 +1,12 @@
 name: Check upstream FFmpeg releases
 
-# Manual/dispatch-only check of FFmpeg upstream release tags (n<version>).
+# Upstream FFmpeg release tag check (n<version>).
 # When a new n-tag is found (or a rebuild is forced), it triggers
 # release-static.yml for that branch with doRelease=true.
 
 on:
+  schedule:
+    - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       branch:
@@ -44,7 +46,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       FORCE: ${{ inputs.force || false }}
-      DRY_RUN: ${{ inputs.dry_run == false && 'false' || 'true' }}
+      DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run == true) && 'true' || 'false' }}
       BRANCH_FILTER: ${{ inputs.branch || 'all' }}
     steps:
       - name: Compare upstream tags to last-seen variables
